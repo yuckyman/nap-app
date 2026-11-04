@@ -1,0 +1,11 @@
+# local products. the .app bundle is not part of the source repo.
+/build/
+/.build/
+/.swiftpm/
+/DerivedData/
+*.dSYM
+*.xcodeproj
+xcuserdata/
+*.xcuserstate
+.DS_Store
+.env
