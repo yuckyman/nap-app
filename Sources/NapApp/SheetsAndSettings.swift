@@ -75,6 +75,9 @@ struct ExportView: View {
             HStack {
                 Spacer()
                 if started {
+                    if job.running {
+                        Button("cancel") { job.cancel() }
+                    }
                     Button("done") { dismiss() }
                         .keyboardShortcut(.defaultAction)
                         .disabled(job.running)

@@ -183,7 +183,10 @@ public enum RollIngest {
     /// things shift more than far things, so the spread of flow grows with
     /// lens distance while any scan offset cancels out. Reversed order is the
     /// same boomerang, so only one direction is tried.
-    public static func orderLenses(_ urls: [URL]) -> ([URL], Double) {
+    public static func orderLenses(
+        _ urls: [URL], isCancelled: @escaping @Sendable () -> Bool = { false }
+    ) -> ([URL], Double) {
+        if isCancelled() { return (urls, 0) }
         let byName = urls.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
         let grays: [GrayImage] = byName.compactMap { url in
             guard let thumb = ImageLoader.thumbnail(url, maxPixel: 800) else { return nil }
@@ -199,8 +202,12 @@ public enum RollIngest {
         var votes: [(positions: [Double], weight: Double)] = []
         var parallax = 0.0
         for anchor in grays.indices {
-            guard let (raw, range) = lensPositions(grays, anchor: anchor), range >= 1,
-                  let lo = raw.min(), let hi = raw.max(), hi > lo else { continue }
+            if isCancelled() { return (byName, 0) }
+            guard let (raw, range) = lensPositions(grays, anchor: anchor, isCancelled: isCancelled) else {
+                if isCancelled() { return (byName, 0) }
+                continue
+            }
+            guard range >= 1, let lo = raw.min(), let hi = raw.max(), hi > lo else { continue }
             var positions = raw.map { ($0 - lo) / (hi - lo) }
             if let reference = votes.first?.positions,
                zip(positions, reference).reduce(0.0, { $0 + ($1.0 - 0.5) * ($1.1 - 0.5) }) < 0 {
@@ -223,7 +230,9 @@ public enum RollIngest {
     /// α_k·d(p) for a per-point depth signal d. The frame with the most motion
     /// supplies d; α comes from a trimmed least-squares fit of 2D vectors, so
     /// scans rotated 90° work too. Returns the parallax range in pixels.
-    static func lensPositions(_ grays: [GrayImage], anchor: Int) -> ([Double], Double)? {
+    static func lensPositions(
+        _ grays: [GrayImage], anchor: Int, isCancelled: @escaping @Sendable () -> Bool = { false }
+    ) -> ([Double], Double)? {
         let base = grays[anchor]
         let step = max(4, min(base.width, base.height) / 70)
         var points: [SIMD2<Double>] = []
@@ -236,6 +245,7 @@ public enum RollIngest {
 
         var motion: [[SIMD2<Double>]] = []
         for k in grays.indices {
+            if isCancelled() { return nil }
             if k == anchor { motion.append(Array(repeating: .zero, count: points.count)); continue }
             guard let field = try? FlowMatcher.flow(from: base, to: grays[k]) else { return nil }
             let flows = points.map { field.at($0) }

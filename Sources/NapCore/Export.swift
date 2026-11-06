@@ -154,22 +154,27 @@ public enum Exporter {
 
     @discardableResult
     public static func export(
-        _ aligned: AlignedBatch, to targets: ExportTargets, settings: ExportSettings
+        _ aligned: AlignedBatch, to targets: ExportTargets, settings: ExportSettings,
+        isCancelled: @escaping @Sendable () -> Bool = { false }
     ) async throws -> [URL] {
+        if isCancelled() { throw CancellationError() }
         let frames = aligned.alignedFrames
         var written: [URL] = []
         if let dir = targets.stillsDirectory {
+            if isCancelled() { throw CancellationError() }
             written += try writeStills(aligned, to: dir)
         }
         if let url = targets.gif {
+            if isCancelled() { throw CancellationError() }
             let graded = cgImages(gradedImages(frames, maxDimension: settings.gifMaxDimension, strength: settings.brightnessStrength))
             try writeGIF(graded, order: Boomerang.gifOrder(count: graded.count), fps: settings.fps, to: url)
             written.append(url)
         }
         if let url = targets.mp4 {
+            if isCancelled() { throw CancellationError() }
             let graded = gradedImages(frames, evenDimensions: true, strength: settings.brightnessStrength)
             try await writeMP4(graded, order: Boomerang.mp4Order(count: graded.count, loops: settings.mp4Loops),
-                               fps: settings.fps, to: url)
+                               fps: settings.fps, to: url, isCancelled: isCancelled)
             written.append(url)
         }
         return written
@@ -196,7 +201,10 @@ public enum Exporter {
 
     /// H.264 via VideoToolbox. Bitrate is generous on purpose: grain is
     /// high-frequency noise and starves at normal web rates.
-    public static func writeMP4(_ frames: [CIImage], order: [Int], fps: Int, to url: URL) async throws {
+    public static func writeMP4(
+        _ frames: [CIImage], order: [Int], fps: Int, to url: URL,
+        isCancelled: @escaping @Sendable () -> Bool = { false }
+    ) async throws {
         guard let first = frames.first else { return }
         let width = Int(first.extent.width), height = Int(first.extent.height)
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -252,8 +260,17 @@ public enum Exporter {
         }
 
         let timescale = CMTimeScale(fps)
+        func stop() throws -> Never {
+            writer.cancelWriting()
+            try? FileManager.default.removeItem(at: url)
+            throw CancellationError()
+        }
         for (n, index) in order.enumerated() {
-            while !input.isReadyForMoreMediaData { try await Task.sleep(nanoseconds: 5_000_000) }
+            if isCancelled() { try stop() }
+            while !input.isReadyForMoreMediaData {
+                if isCancelled() { try stop() }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
             guard adaptor.append(buffers[index], withPresentationTime: CMTime(value: CMTimeValue(n), timescale: timescale)) else {
                 throw ExportError.encode(url, writer.error?.localizedDescription ?? "append failed")
             }
@@ -267,10 +284,11 @@ public enum Exporter {
     }
 
     /// Full-resolution print frames on the shared crop, named `01_<scan name>`.
-    /// No brightness grade, so the prints register with the wiggle. JPEG is
-    /// quality 1.0, PNG and TIFF stay lossless, WebP becomes PNG because
-    /// ImageIO cannot encode it. The scan's color profile rides along with the
-    /// cropped CGImage; every file gets the first DPI found.
+    /// No brightness grade, so the prints register with the wiggle. A quiet
+    /// row of dots in the bottom-right corner marks which frame this is.
+    /// JPEG is quality 1.0, PNG and TIFF stay lossless, WebP becomes PNG
+    /// because ImageIO cannot encode it. The scan's color profile rides along
+    /// with the cropped CGImage; every file gets the first DPI found.
     public static func writeStills(_ aligned: AlignedBatch, to directory: URL) throws -> [URL] {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let dpi = aligned.sources.lazy.compactMap(\.dpi).first
@@ -294,10 +312,65 @@ public enum Exporter {
             if type == .tiff {
                 props[kCGImagePropertyTIFFDictionary] = [kCGImagePropertyTIFFCompression: 5]
             }
-            CGImageDestinationAddImage(dest, aligned.alignedFrame(index), props as CFDictionary)
+            let marked = StillFrameMarks.stamp(aligned.alignedFrame(index), index: index, count: aligned.sources.count)
+            CGImageDestinationAddImage(dest, marked, props as CFDictionary)
             guard CGImageDestinationFinalize(dest) else { throw ExportError.encode(url, "imageio finalize failed") }
             written.append(url)
         }
         return written
+    }
+}
+
+/// A pager in the bottom-right of a print still: one dot per frame, the current one a little stronger.
+enum StillFrameMarks {
+    /// Centers use a top-left origin, y pointing down, in pixels of the still.
+    static func layout(width: Int, height: Int, count: Int) -> (diameter: Double, centers: [CGPoint]) {
+        let count = max(1, count)
+        let short = Double(min(width, height))
+        let diameter = max(6, (short / 200).rounded())
+        let gap = diameter * 0.65
+        let margin = diameter * 2.4
+        let span = diameter * Double(count) + gap * Double(max(0, count - 1))
+        let originX = Double(width) - margin - span
+        let centerY = Double(height) - margin - diameter / 2
+        let centers = (0..<count).map { i in
+            CGPoint(x: originX + diameter / 2 + Double(i) * (diameter + gap), y: centerY)
+        }
+        return (diameter, centers)
+    }
+
+    static func stamp(_ image: CGImage, index: Int, count: Int) -> CGImage {
+        let width = image.width, height = image.height
+        guard width > 16, height > 16, count > 0 else { return image }
+        guard let context = context(for: image) else { return image }
+        context.interpolationQuality = .none
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let (diameter, centers) = layout(width: width, height: height, count: count)
+        let current = min(max(0, index), centers.count - 1)
+        for (i, center) in centers.enumerated() {
+            let active = i == current
+            let cy = Double(height) - center.y
+            let rect = CGRect(x: center.x - diameter / 2, y: cy - diameter / 2, width: diameter, height: diameter)
+            context.setFillColor(red: 0, green: 0, blue: 0, alpha: active ? 0.22 : 0.12)
+            context.fillEllipse(in: rect.insetBy(dx: -diameter * 0.18, dy: -diameter * 0.18))
+            context.setFillColor(red: 1, green: 1, blue: 1, alpha: active ? 0.62 : 0.30)
+            context.fillEllipse(in: rect)
+        }
+        return context.makeImage() ?? image
+    }
+
+    private static func context(for image: CGImage) -> CGContext? {
+        let spaces = [image.colorSpace, CGColorSpace(name: CGColorSpace.sRGB)].compactMap { $0 }
+        for space in spaces {
+            if let context = CGContext(
+                data: nil, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            ) {
+                return context
+            }
+        }
+        return nil
     }
 }

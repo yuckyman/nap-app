@@ -29,6 +29,10 @@ final class IngestSession: Identifiable {
     var subjects: [URL: CGPoint] = [:]
     var move = false
     var firstNumber = 1
+    /// Batches whose lens order is being recomputed. A newer request cancels the older one.
+    var ordering: Set<UUID> = []
+    @ObservationIgnored private var orderGeneration: [UUID: Int] = [:]
+    @ObservationIgnored private var orderFlags: [UUID: CancelFlag] = [:]
 
     init(roll: URL, destination: URL?) {
         self.roll = roll
@@ -153,14 +157,35 @@ final class IngestSession: Identifiable {
 
     func reorderByParallax(_ batchID: UUID) {
         guard let b = batches.firstIndex(where: { $0.id == batchID }) else { return }
+        orderFlags[batchID]?.cancel()
+        let flag = CancelFlag()
+        orderFlags[batchID] = flag
+        let token = (orderGeneration[batchID] ?? 0) + 1
+        orderGeneration[batchID] = token
+        ordering.insert(batchID)
         let frames = batches[b].frames
         Task {
-            let (ordered, parallax) = await Task.detached { RollIngest.orderLenses(frames) }.value
-            guard let b = batches.firstIndex(where: { $0.id == batchID }) else { return }
+            let (ordered, parallax) = await Task.detached {
+                RollIngest.orderLenses(frames, isCancelled: { flag.isCancelled })
+            }.value
+            guard orderGeneration[batchID] == token, !flag.isCancelled else { return }
+            guard let b = batches.firstIndex(where: { $0.id == batchID }), batches[b].frames == frames else {
+                ordering.remove(batchID)
+                return
+            }
             batches[b].frames = ordered
             batches[b].parallax = parallax
             batches[b].manuallyOrdered = false
+            ordering.remove(batchID)
         }
+    }
+
+    func cancelOrdering() {
+        for (id, flag) in orderFlags {
+            flag.cancel()
+            orderGeneration[id, default: 0] += 1
+        }
+        ordering.removeAll()
     }
 
     func commit(into root: URL) throws -> [URL] {
@@ -368,6 +393,7 @@ struct IngestView: View {
 
     private func commit() {
         guard let root = model.settings.inputURL else { return }
+        session.cancelOrdering()
         session.phase = .importing
         do {
             let written = session.importable
@@ -403,7 +429,9 @@ struct BatchProposalRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(number.map { String(format: "%02d", $0) } ?? "—")
                     .font(.title3.monospacedDigit().weight(.semibold))
-                if !(3...4).contains(batch.frames.count) {
+                if session.ordering.contains(batch.id) {
+                    Text("ordering").font(.caption2).foregroundStyle(.secondary)
+                } else if !(3...4).contains(batch.frames.count) {
                     Text("needs 3–4").font(.caption2).foregroundStyle(.red)
                 } else if batch.manuallyOrdered {
                     Text("by hand").font(.caption2).foregroundStyle(.secondary)
@@ -433,6 +461,7 @@ struct BatchProposalRow: View {
                     .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
                 Menu {
                     Button("re-order by parallax") { session.reorderByParallax(batch.id) }
+                        .disabled(session.ordering.contains(batch.id))
                     Button("break up into leftovers") { session.dissolve(batch.id) }
                 } label: { Image(systemName: "ellipsis.circle") }
                     .menuStyle(.borderlessButton)

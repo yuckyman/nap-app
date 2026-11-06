@@ -151,20 +151,54 @@ final class AppModel {
         guard !batches.isEmpty, !kinds.isEmpty, !exportJob.running else { return }
         let settings = settings
         exportJob.begin(total: batches.count)
+        let flag = exportJob.flag
+        let label = kinds.map(\.rawValue).sorted().joined(separator: " + ")
         exportJob.task = Task {
             for batch in batches {
-                if Task.isCancelled { exportJob.log.append("cancelled"); break }
+                if flag.isCancelled || Task.isCancelled {
+                    exportJob.log.append("cancelled")
+                    break
+                }
                 let options = settings.pipelineOptions(anchors: anchorStore[batch])
                 let targets = settings.targets(for: batch, kinds: kinds)
+                let session = sessions[batch.id]
                 do {
-                    let aligned = try await Task.detached(priority: .userInitiated) {
-                        try NapPipeline.align(batch: batch, options: options)
-                    }.value
-                    try await Exporter.export(aligned, to: targets, settings: settings.exportSettings)
+                    let aligned: AlignedBatch
+                    let cached: Bool
+                    let generation: Int?
+                    if let session {
+                        let prepared = try await session.alignment(matching: options, flag: flag)
+                        aligned = prepared.aligned
+                        cached = prepared.cached
+                        generation = prepared.generation
+                    } else {
+                        aligned = try await Task.detached(priority: .userInitiated) {
+                            try NapPipeline.align(batch: batch, options: options, isCancelled: { flag.isCancelled })
+                        }.value
+                        cached = false
+                        generation = nil
+                    }
+                    if flag.isCancelled { throw CancellationError() }
+                    session?.mark("exporting " + label, generation: generation)
+                    let urls = try await Exporter.export(
+                        aligned, to: targets, settings: settings.exportSettings, isCancelled: { flag.isCancelled }
+                    )
                     let conf = aligned.reports.dropFirst().map(\.confidence).min() ?? 1
                     exportJob.log.append("✓ \(batch.name)  min conf \(String(format: "%.2f", conf))"
-                                          + (aligned.warnings.isEmpty ? "" : "  ⚠︎ \(aligned.warnings.count)"))
+                                          + (aligned.warnings.isEmpty ? "" : "  ⚠︎ \(aligned.warnings.count)")
+                                          + (cached ? "  · cached" : ""))
+                    if let generation { session?.noteExported(urls, generation: generation) }
+                } catch is CancellationError {
+                    session?.settleCancelIfCurrent(flag)
+                    exportJob.log.append("cancelled")
+                    break
                 } catch {
+                    if flag.isCancelled {
+                        session?.settleCancelIfCurrent(flag)
+                        exportJob.log.append("cancelled")
+                        break
+                    }
+                    session?.failIfCurrent(flag, error.localizedDescription)
                     exportJob.log.append("✗ \(batch.name): \(error.localizedDescription)")
                 }
                 exportJob.done += 1
@@ -182,15 +216,21 @@ final class RangeJob {
     var total = 0
     var log: [String] = []
     @ObservationIgnored var task: Task<Void, Never>?
+    /// Shared with the in-flight batch so cancel stops the next flow, not just the next batch.
+    @ObservationIgnored var flag = CancelFlag()
 
     func begin(total: Int) {
+        flag = CancelFlag()
         running = true
         done = 0
         self.total = total
         log = []
     }
 
-    func cancel() { task?.cancel() }
+    func cancel() {
+        flag.cancel()
+        task?.cancel()
+    }
 
     func reset() {
         guard !running else { return }
@@ -198,6 +238,30 @@ final class RangeJob {
         total = 0
         log = []
     }
+}
+
+/// Cooperative cancel for a pipeline that cannot interrupt a Vision request already in `perform`.
+final class CancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
+private struct RenderedAlignment: @unchecked Sendable {
+    var aligned: AlignedBatch
+    var preview: [CGImage]
+    var overlays: [CGImage]
 }
 
 @Observable @MainActor
@@ -214,6 +278,8 @@ final class BatchSession {
     private(set) var preview: [CGImage] = []
     private(set) var overlays: [CGImage] = []
     private(set) var aligned: AlignedBatch?
+    /// Options that produced `aligned`. Export skips Vision when these still match.
+    private var alignedOptions: PipelineOptions?
     private(set) var anchors: [CGPoint?]
     private(set) var status: Status = .idle
     private(set) var lastExport: [URL] = []
@@ -222,6 +288,11 @@ final class BatchSession {
     @ObservationIgnored private let onExported: () -> Void
     @ObservationIgnored private let onReordered: (Batch) -> Void
     @ObservationIgnored private var generation = 0
+    @ObservationIgnored private var job: Task<Void, Never>?
+    @ObservationIgnored private var debounce: Task<Void, Never>?
+    @ObservationIgnored private var cancelFlag = CancelFlag()
+    /// Options of the align `job` is computing, when one is in flight.
+    @ObservationIgnored private var inflightOptions: PipelineOptions?
     /// A drag-reorder's mouse-up also lands as a click. Ignore that pin.
     @ObservationIgnored private var ignoreAnchorUntil = Date.distantPast
 
@@ -274,7 +345,6 @@ final class BatchSession {
         let dest = min(max(0, adjusted), urls.count)
         guard dest != from else { return }
         urls.insert(moved, at: dest)
-        generation += 1
         let permutation = urls.compactMap { item in batch.imageURLs.firstIndex(of: item) }
         do {
             let renamed = try BatchScanner.applyLensOrder(urls)
@@ -282,6 +352,7 @@ final class BatchSession {
             persistAnchors(anchors)
             if raw.count == permutation.count { raw = permutation.map { raw[$0] } }
             aligned = nil
+            alignedOptions = nil
             preview = []
             overlays = []
             batch = Batch(url: batch.url, imageURLs: renamed)
@@ -297,46 +368,184 @@ final class BatchSession {
         persistAnchors(anchors)
     }
 
-    func align(_ settings: NapSettings) {
-        generation += 1
-        let generation = generation
-        let batch = batch
+    /// Pins and quality changes wait out a short burst so each click is not its own pipeline.
+    func align(_ settings: NapSettings, debounced: Bool = false) {
+        if debounced {
+            debounce?.cancel()
+            debounce = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                guard !Task.isCancelled, let self else { return }
+                self.debounce = nil
+                self.startAlign(settings)
+            }
+            return
+        }
+        debounce?.cancel()
+        debounce = nil
+        startAlign(settings)
+    }
+
+    func startAlign(_ settings: NapSettings) {
+        let flag = CancelFlag()
+        let generation = arm(flag)
         let options = settings.pipelineOptions(anchors: anchors)
+        let batch = batch
+        inflightOptions = options
         status = .working("aligning")
-        Task {
+        job = Task {
+            defer { if generation == self.generation { self.inflightOptions = nil } }
             do {
-                let (aligned, preview, overlays) = try await Task.detached(priority: .userInitiated) {
-                    let aligned = try NapPipeline.align(batch: batch, options: options)
-                    let preview = Exporter.previewFrames(aligned, maxDimension: 1200)
-                    let overlays = aligned.subjects.compactMap { $0.mask.overlayImage(red: 224, green: 102, blue: 45, alpha: 110) }
-                    return (aligned, preview, overlays)
-                }.value
-                guard generation == self.generation else { return }
-                self.aligned = aligned
-                self.preview = preview
-                self.overlays = overlays
-                status = .ready
+                let rendered = try await Self.render(batch: batch, options: options, flag: flag)
+                guard generation == self.generation, !flag.isCancelled else {
+                    self.settleCancel(generation)
+                    return
+                }
+                self.apply(rendered, options: options)
+                self.status = .ready
+            } catch is CancellationError {
+                self.settleCancel(generation)
             } catch {
-                guard generation == self.generation else { return }
-                status = .failed(error.localizedDescription)
+                guard generation == self.generation, !flag.isCancelled else { return }
+                self.status = .failed(error.localizedDescription)
             }
         }
     }
 
     func export(_ kinds: Set<ExportKind>, settings: NapSettings) {
-        guard let aligned, !isWorking else { return }
+        let flag = CancelFlag()
+        let generation = arm(flag)
+        let batch = batch
+        let options = settings.pipelineOptions(anchors: anchors)
         let targets = settings.targets(for: batch, kinds: kinds)
         let exportSettings = settings.exportSettings
-        status = .working("exporting " + kinds.map(\.rawValue).sorted().joined(separator: " + "))
-        Task {
+        let label = kinds.map(\.rawValue).sorted().joined(separator: " + ")
+        status = .working(alignedOptions == options && aligned != nil ? "exporting " + label : "aligning")
+        job = Task {
             do {
-                lastExport = try await Exporter.export(aligned, to: targets, settings: exportSettings)
-                status = .ready
-                onExported()
+                let rendered: RenderedAlignment
+                if let aligned = self.aligned, self.alignedOptions == options {
+                    rendered = RenderedAlignment(aligned: aligned, preview: self.preview, overlays: self.overlays)
+                } else {
+                    rendered = try await Self.render(batch: batch, options: options, flag: flag)
+                    guard generation == self.generation, !flag.isCancelled else { throw CancellationError() }
+                    self.apply(rendered, options: options)
+                    self.status = .working("exporting " + label)
+                }
+                if flag.isCancelled || generation != self.generation { throw CancellationError() }
+                let urls = try await Exporter.export(
+                    rendered.aligned, to: targets, settings: exportSettings, isCancelled: { flag.isCancelled }
+                )
+                guard generation == self.generation, !flag.isCancelled else { return }
+                self.lastExport = urls
+                self.status = .ready
+                self.onExported()
+            } catch is CancellationError {
+                self.settleCancel(generation)
             } catch {
-                status = .failed(error.localizedDescription)
+                guard generation == self.generation, !flag.isCancelled else { return }
+                self.status = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Sidebar export. `cached` means the on-screen alignment already matched, so Vision was skipped.
+    func alignment(
+        matching options: PipelineOptions, flag: CancelFlag
+    ) async throws -> (aligned: AlignedBatch, cached: Bool, generation: Int) {
+        debounce?.cancel()
+        debounce = nil
+        if let aligned, alignedOptions == options, !isWorking {
+            cancelFlag = flag
+            return (aligned, true, generation)
+        }
+        if inflightOptions == options, let job {
+            await job.value
+            if flag.isCancelled { throw CancellationError() }
+            if let aligned, alignedOptions == options, !isWorking {
+                cancelFlag = flag
+                return (aligned, true, generation)
+            }
+        }
+        if flag.isCancelled { throw CancellationError() }
+        let generation = arm(flag)
+        let batch = batch
+        inflightOptions = options
+        status = .working("aligning")
+        do {
+            let rendered = try await Self.render(batch: batch, options: options, flag: flag)
+            guard generation == self.generation, !flag.isCancelled else { throw CancellationError() }
+            apply(rendered, options: options)
+            inflightOptions = nil
+            status = .ready
+            return (rendered.aligned, false, generation)
+        } catch {
+            if generation == self.generation { inflightOptions = nil }
+            throw error
+        }
+    }
+
+    func mark(_ label: String, generation: Int?) {
+        guard let generation, generation == self.generation else { return }
+        status = .working(label)
+    }
+
+    func noteExported(_ urls: [URL], generation: Int) {
+        guard generation == self.generation else { return }
+        if !urls.isEmpty { lastExport = urls }
+        status = .ready
+        onExported()
+    }
+
+    func settleCancel(_ generation: Int) {
+        guard generation == self.generation else { return }
+        status = aligned == nil ? .idle : .ready
+    }
+
+    /// Export was cancelled from outside. Leave a newer pin or quality change alone.
+    func settleCancelIfCurrent(_ flag: CancelFlag) {
+        guard cancelFlag === flag else { return }
+        status = aligned == nil ? .idle : .ready
+    }
+
+    func fail(_ generation: Int, _ message: String) {
+        guard generation == self.generation else { return }
+        status = .failed(message)
+    }
+
+    func failIfCurrent(_ flag: CancelFlag, _ message: String) {
+        guard cancelFlag === flag else { return }
+        status = .failed(message)
+    }
+
+    /// Stops the previous align or export and hands the session to `flag`.
+    private func arm(_ flag: CancelFlag) -> Int {
+        debounce?.cancel()
+        debounce = nil
+        let previous = cancelFlag
+        if previous !== flag { previous.cancel() }
+        job?.cancel()
+        job = nil
+        cancelFlag = flag
+        inflightOptions = nil
+        generation += 1
+        return generation
+    }
+
+    private func apply(_ rendered: RenderedAlignment, options: PipelineOptions) {
+        aligned = rendered.aligned
+        preview = rendered.preview
+        overlays = rendered.overlays
+        alignedOptions = options
+    }
+
+    private static func render(batch: Batch, options: PipelineOptions, flag: CancelFlag) async throws -> RenderedAlignment {
+        try await Task.detached(priority: .userInitiated) {
+            let aligned = try NapPipeline.align(batch: batch, options: options, isCancelled: { flag.isCancelled })
+            if flag.isCancelled { throw CancellationError() }
+            let preview = Exporter.previewFrames(aligned, maxDimension: 1200)
+            let overlays = aligned.subjects.compactMap { $0.mask.overlayImage(red: 224, green: 102, blue: 45, alpha: 110) }
+            return RenderedAlignment(aligned: aligned, preview: preview, overlays: overlays)
+        }.value
     }
 
     func revealExports() {

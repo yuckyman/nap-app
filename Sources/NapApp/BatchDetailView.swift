@@ -27,7 +27,7 @@ struct BatchDetailView: View {
             Divider()
             FrameStrip(session: session, showMasks: showMasks) { index, point in
                 session.setAnchor(index, point)
-                session.align(model.settings)
+                session.align(model.settings, debounced: true)
             }
             .frame(height: 230)
 
@@ -63,7 +63,7 @@ struct BatchDetailView: View {
                     ForEach(QualityPreset.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .help("analysis resolution and gif size")
-                .onChange(of: model.settings.quality) { session.align(model.settings) }
+                .onChange(of: model.settings.quality) { session.align(model.settings, debounced: true) }
 
                 Button { session.align(model.settings) } label: { Label("re-align", systemImage: "scope") }
                     .keyboardShortcut("r")

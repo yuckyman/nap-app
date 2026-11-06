@@ -1,7 +1,7 @@
 import CoreGraphics
 import Foundation
 
-public struct PipelineOptions: Sendable {
+public struct PipelineOptions: Sendable, Equatable {
     public var quality: QualityPreset
     /// Per-frame subject clicks, normalized 0...1 with a top-left origin.
     public var anchors: [CGPoint?]
@@ -80,9 +80,17 @@ public enum PipelineError: LocalizedError {
 }
 
 public enum NapPipeline {
-    public static func align(batch: Batch, options: PipelineOptions = .init()) throws -> AlignedBatch {
+    /// `isCancelled` is checked between stages. A Vision request already inside
+    /// `perform` runs to the end; the next frame's flow does not start.
+    public static func align(
+        batch: Batch,
+        options: PipelineOptions = .init(),
+        isCancelled: @escaping @Sendable () -> Bool = { false }
+    ) throws -> AlignedBatch {
+        if isCancelled() { throw CancellationError() }
         guard batch.imageURLs.count >= 3 else { throw PipelineError.notEnoughScans(batch.imageURLs.count) }
         let frames = ImageLoader.normalizeSizes(try batch.imageURLs.map(ImageLoader.load))
+        if isCancelled() { throw CancellationError() }
         let n = frames.count
         let fullW = frames[0].width, fullH = frames[0].height
 
@@ -98,7 +106,11 @@ public enum NapPipeline {
             return g.equalized()
         }
 
-        let instances = parallelMap(n) { SubjectSegmenter.instances(in: colors[$0]) }
+        let instances = parallelMap(n) { i -> [SubjectInstance] in
+            if isCancelled() { return [] }
+            return SubjectSegmenter.instances(in: colors[i])
+        }
+        if isCancelled() { throw CancellationError() }
         let anchors: [CGPoint?] = (0..<n).map { i in
             guard i < options.anchors.count, let a = options.anchors[i] else { return nil }
             return CGPoint(x: a.x * Double(aw), y: a.y * Double(ah))
@@ -108,6 +120,7 @@ public enum NapPipeline {
             saliency: { SubjectSegmenter.saliencyMask(in: colors[$0]) },
             width: aw, height: ah
         )
+        if isCancelled() { throw CancellationError() }
 
         // 5px at full resolution, the python RANSAC threshold.
         let threshold = max(1.0, 5.0 * kx)
@@ -116,9 +129,15 @@ public enum NapPipeline {
                 return (.zero, FrameReport(offsetX: 0, offsetY: 0, matches: 0, inliers: 0, iou: 1, confidence: 1,
                                            method: .reference, subject: subjects[0].source))
             }
+            if isCancelled() {
+                return (.zero, FrameReport(offsetX: 0, offsetY: 0, matches: 0, inliers: 0, iou: 0, confidence: 0,
+                                           method: .centroid, subject: subjects[i].source))
+            }
             return estimateFrame(i, grays: grays, subjects: subjects, threshold: threshold,
-                                 consistency: options.quality.consistencyCheck, width: aw, height: ah)
+                                 consistency: options.quality.consistencyCheck, width: aw, height: ah,
+                                 isCancelled: isCancelled)
         }
+        if isCancelled() { throw CancellationError() }
 
         let refCenter = subjects[0].center
         var warnings: [String] = []
@@ -161,7 +180,8 @@ public enum NapPipeline {
     /// Analysis-space translation for one frame plus its report.
     private static func estimateFrame(
         _ i: Int, grays: [GrayImage], subjects: [SubjectChoice],
-        threshold: Double, consistency: Bool, width w: Int, height h: Int
+        threshold: Double, consistency: Bool, width w: Int, height h: Int,
+        isCancelled: @escaping @Sendable () -> Bool
     ) -> (SIMD2<Double>, FrameReport) {
         let refMask = subjects[0].mask
         let c0 = subjects[0].center, ci = subjects[i].center
@@ -176,6 +196,11 @@ public enum NapPipeline {
 
         // Subject pass: centroid pre-shift, then flow inside the reference mask.
         let valid = CGRect(x: max(0, dx), y: max(0, dy), width: w - abs(dx), height: h - abs(dy))
+        if isCancelled() {
+            let (iou, _) = score(d, nil)
+            return (d, FrameReport(offsetX: 0, offsetY: 0, matches: 0, inliers: 0, iou: iou, confidence: 0,
+                                   method: .centroid, subject: subjects[i].source))
+        }
         let subject = try? FlowMatcher.estimate(
             reference: grays[0], target: grays[i].shifted(dx: dx, dy: dy), sampleMask: refMask,
             valid: valid, threshold: threshold, consistencyCheck: consistency
@@ -186,7 +211,7 @@ public enum NapPipeline {
         }
 
         let strong = subject.map { $0.inliers >= 30 && Double($0.inliers) >= 0.3 * Double($0.matches) } ?? false
-        if !strong, let full = try? FlowMatcher.estimate(
+        if !strong, !isCancelled(), let full = try? FlowMatcher.estimate(
             reference: grays[0], target: grays[i], sampleMask: .full(width: w, height: h),
             valid: CGRect(x: 0, y: 0, width: w, height: h), threshold: threshold, consistencyCheck: consistency
         ) {

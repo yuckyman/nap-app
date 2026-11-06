@@ -272,3 +272,76 @@ func noiseImage(width: Int, height: Int, seed: UInt64) -> GrayImage {
         #expect(BatchScanner.stableBase("scan.jpg") == "scan.jpg")
     }
 }
+
+@Suite struct CancellationTests {
+    @Test func alignReturnsBeforeReadingScans() {
+        let batch = Batch(url: URL(fileURLWithPath: "/tmp/nap-cancel"), imageURLs: (0..<3).map {
+            URL(fileURLWithPath: "/tmp/nap-cancel/\($0).jpg")
+        })
+        #expect(throws: CancellationError.self) {
+            try NapPipeline.align(batch: batch, isCancelled: { true })
+        }
+    }
+
+    @Test func orderLensesReturnsTheInputWhenCancelled() {
+        let urls = ["c.jpg", "a.jpg", "b.jpg"].map { URL(fileURLWithPath: "/tmp/nap-cancel/\($0)") }
+        let (ordered, parallax) = RollIngest.orderLenses(urls, isCancelled: { true })
+        #expect(ordered == urls)
+        #expect(parallax == 0)
+    }
+
+    @Test func pipelineOptionsCompareAnchorsAndQuality() {
+        let point = CGPoint(x: 0.5, y: 0.25)
+        let base = PipelineOptions(quality: .best, anchors: [point, nil], centerSubject: true)
+        #expect(base == PipelineOptions(quality: .best, anchors: [point, nil], centerSubject: true))
+        #expect(base != PipelineOptions(quality: .fast, anchors: [point, nil], centerSubject: true))
+        #expect(base != PipelineOptions(quality: .best, anchors: [nil, point], centerSubject: true))
+        #expect(base != PipelineOptions(quality: .best, anchors: [point, nil], centerSubject: false))
+    }
+}
+
+@Suite struct StillFrameMarkTests {
+    @Test func pagerSitsInTheBottomRightAndLightsTheCurrentDot() {
+        let width = 400, height = 260
+        let plate = solid(width, height, 128)
+        let (diameter, centers) = StillFrameMarks.layout(width: width, height: height, count: 4)
+        #expect(centers.count == 4)
+        #expect(centers.allSatisfy { $0.x > Double(width) * 0.6 && $0.y > Double(height) * 0.75 })
+        #expect(zip(centers, centers.dropFirst()).allSatisfy { $0.x < $1.x })
+
+        let marked = StillFrameMarks.stamp(plate, index: 1, count: 4)
+        let background = luminance(marked, x: 8, y: 8)
+        let active = luminance(marked, x: Int(centers[1].x), y: Int(centers[1].y))
+        let quiet = luminance(marked, x: Int(centers[0].x), y: Int(centers[0].y))
+        #expect(abs(Int(background) - 128) <= 2, "the print itself stays put, got \(background)")
+        #expect(active > quiet + 15, "current dot should read stronger: \(active) vs \(quiet)")
+        #expect(quiet > background + 8, "the other dots should still be there: \(quiet) vs \(background)")
+        #expect(diameter >= 6)
+
+        let three = StillFrameMarks.layout(width: width, height: height, count: 3).centers
+        #expect(three.count == 3)
+    }
+
+    private func solid(_ width: Int, _ height: Int, _ value: UInt8) -> CGImage {
+        let ctx = CGContext(
+            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+            space: Exporter.sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        let v = CGFloat(value) / 255
+        ctx.setFillColor(red: v, green: v, blue: v, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        return ctx.makeImage()!
+    }
+
+    /// `y` is down from the top of the image.
+    private func luminance(_ image: CGImage, x: Int, y: Int) -> UInt8 {
+        var px = [UInt8](repeating: 0, count: 4)
+        let ctx = CGContext(
+            data: &px, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
+            space: Exporter.sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        )!
+        ctx.interpolationQuality = .none
+        ctx.draw(image, in: CGRect(x: -x, y: -(image.height - 1 - y), width: image.width, height: image.height))
+        return px[0]
+    }
+}
