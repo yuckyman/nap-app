@@ -37,7 +37,8 @@ public enum BatchScanner {
         return Batch(url: directory.standardizedFileURL, imageURLs: Array(files.prefix(4)))
     }
 
-    /// Every subfolder that holds a batch, in natural order (2 before 10).
+    /// Every subfolder that holds a batch, newest first (`180` before `20`).
+    /// Numbered folders compare as integers; anything else uses a descending natural order.
     public static func batches(in root: URL) -> [Batch] {
         let children = (try? FileManager.default.contentsOfDirectory(
             at: root,
@@ -47,7 +48,10 @@ public enum BatchScanner {
         return children
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
             .compactMap(batch(at:))
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            .sorted { a, b in
+                if let an = a.number, let bn = b.number, an != bn { return an > bn }
+                return a.name.localizedStandardCompare(b.name) == .orderedDescending
+            }
     }
 
     /// The scan's own filename, without the `1-` lens prefix ingest adds.

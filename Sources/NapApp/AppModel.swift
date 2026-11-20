@@ -61,19 +61,32 @@ final class AppModel {
         } else if focus == nil {
             focus = selection.first
         }
+        reside(at: focus)
     }
 
     func session(for batch: Batch) -> BatchSession {
-        if let existing = sessions[batch.id] { return existing }
-        let session = BatchSession(batch: batch, anchors: anchorStore[batch]) { [weak self] anchors in
-            self?.anchorStore[batch] = anchors
-        } onExported: { [weak self] in
-            self?.outputsRevision += 1
-        } onReordered: { [weak self] updated in
-            self?.replace(updated)
+        let session: BatchSession
+        if let existing = sessions[batch.id] {
+            session = existing
+        } else {
+            session = BatchSession(batch: batch, anchors: anchorStore[batch]) { [weak self] anchors in
+                self?.anchorStore[batch] = anchors
+            } onExported: { [weak self] in
+                self?.outputsRevision += 1
+            } onReordered: { [weak self] updated in
+                self?.replace(updated)
+            }
+            sessions[batch.id] = session
         }
-        sessions[batch.id] = session
+        reside(at: focus ?? batch.id)
         return session
+    }
+
+    /// Bitmaps stay with the batch on screen. Every other opened batch keeps the alignment only.
+    private func reside(at id: URL?) {
+        for (key, session) in sessions {
+            session.setResident(key == id)
+        }
     }
 
     /// A dropped folder is either a batch itself or a roll of batches.
@@ -143,8 +156,20 @@ final class AppModel {
     func hasOutput(_ kind: ExportKind, for batch: Batch) -> Bool {
         _ = outputsRevision
         let targets = settings.targets(for: batch, kinds: [kind])
-        guard let url = targets.gif ?? targets.mp4 ?? targets.stillsDirectory else { return false }
-        return FileManager.default.fileExists(atPath: url.path)
+        switch kind {
+        case .gif:
+            return targets.gif.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        case .mp4:
+            return targets.mp4.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        case .stills:
+            guard let dir = targets.stillsDirectory else { return false }
+            return BatchScanner.imageFiles(in: dir).contains { url in
+                let file = url.lastPathComponent
+                guard let mark = file.firstIndex(of: "_") else { return false }
+                let head = file[..<mark]
+                return head.count == 2 && head.allSatisfy(\.isNumber)
+            }
+        }
     }
 
     func runExport(_ batches: [Batch], kinds: Set<ExportKind>) {
@@ -167,7 +192,9 @@ final class AppModel {
                     let cached: Bool
                     let generation: Int?
                     if let session {
-                        let prepared = try await session.alignment(matching: options, flag: flag)
+                        let prepared = try await session.alignment(
+                            matching: options, grade: settings.gradeSettings, flag: flag
+                        )
                         aligned = prepared.aligned
                         cached = prepared.cached
                         generation = prepared.generation
@@ -260,6 +287,7 @@ final class CancelFlag: @unchecked Sendable {
 
 private struct RenderedAlignment: @unchecked Sendable {
     var aligned: AlignedBatch
+    var ungradedPreview: [CGImage]
     var preview: [CGImage]
     var overlays: [CGImage]
 }
@@ -276,10 +304,15 @@ final class BatchSession {
     private(set) var batch: Batch
     private(set) var raw: [CGImage] = []
     private(set) var preview: [CGImage] = []
+    /// Full-size preview before grading, so slider drags can recolor without Vision.
+    private var ungradedPreview: [CGImage] = []
     private(set) var overlays: [CGImage] = []
-    private(set) var aligned: AlignedBatch?
-    /// Options that produced `aligned`. Export skips Vision when these still match.
+    /// Alignment without the scans. Survives leaving the batch.
+    private(set) var geometry: AlignmentGeometry?
+    /// Options that produced `geometry`. A match skips Vision.
     private var alignedOptions: PipelineOptions?
+    /// The batch on screen. Everyone else drops their bitmaps.
+    private var keepPixels = false
     private(set) var anchors: [CGPoint?]
     private(set) var status: Status = .idle
     private(set) var lastExport: [URL] = []
@@ -288,6 +321,8 @@ final class BatchSession {
     @ObservationIgnored private let onExported: () -> Void
     @ObservationIgnored private let onReordered: (Batch) -> Void
     @ObservationIgnored private var generation = 0
+    /// Bumped when a newer grade pass should win, including one still in flight.
+    @ObservationIgnored private var gradeGeneration = 0
     @ObservationIgnored private var job: Task<Void, Never>?
     @ObservationIgnored private var debounce: Task<Void, Never>?
     @ObservationIgnored private var cancelFlag = CancelFlag()
@@ -308,10 +343,39 @@ final class BatchSession {
 
     /// Subject centers the pipeline used, normalized per frame.
     var centers: [CGPoint] {
-        guard let aligned else { return [] }
-        return aligned.subjects.map {
-            CGPoint(x: $0.center.x / aligned.analysisSize.width, y: $0.center.y / aligned.analysisSize.height)
+        guard let geometry, geometry.analysisSize.width > 0, geometry.analysisSize.height > 0 else { return [] }
+        return geometry.subjectCenters.map {
+            CGPoint(x: $0.x / geometry.analysisSize.width, y: $0.y / geometry.analysisSize.height)
         }
+    }
+
+    /// Frame 1's pin in the wiggle's image space, 0...1 from the top-left.
+    func wiggleAnchorPoint(rawMode: Bool) -> CGPoint? {
+        guard let a0 = anchors.first ?? nil else { return nil }
+        if rawMode || geometry == nil { return a0 }
+        return geometry?.alignedPoint(fromSourceAnchor: a0)
+    }
+
+    /// Frame 1's subject center in the wiggle's image space, 0...1 from the top-left.
+    func wiggleCenterPoint(rawMode: Bool) -> CGPoint? {
+        guard let c0 = centers.first else { return nil }
+        if rawMode || geometry == nil { return c0 }
+        return geometry?.alignedPoint(fromSourceAnchor: c0)
+    }
+
+    /// `false` drops the preview bitmaps. The geometry stays.
+    func setResident(_ on: Bool) {
+        guard keepPixels != on else { return }
+        keepPixels = on
+        if !on { releasePixels() }
+    }
+
+    private func releasePixels() {
+        raw = []
+        preview = []
+        ungradedPreview = []
+        overlays = []
+        gradeGeneration += 1
     }
 
     func loadRaw() {
@@ -328,6 +392,25 @@ final class BatchSession {
         guard Date() >= ignoreAnchorUntil else { return }
         guard anchors.indices.contains(index) else { return }
         anchors[index] = point
+        persistAnchors(anchors)
+    }
+
+    /// A click on the wiggle. Frame 1's pin is stored in source space; the other lenses follow it.
+    func setWiggleAnchor(_ point: CGPoint?, rawMode: Bool) {
+        guard Date() >= ignoreAnchorUntil else { return }
+        guard let point else {
+            clearAnchors()
+            return
+        }
+        let sourcePoint: CGPoint
+        if !rawMode, let geometry {
+            sourcePoint = geometry.sourceAnchor(fromAlignedPoint: point)
+        } else {
+            sourcePoint = point
+        }
+        var next = Array<CGPoint?>(repeating: nil, count: batch.imageURLs.count)
+        if !next.isEmpty { next[0] = sourcePoint }
+        anchors = next
         persistAnchors(anchors)
     }
 
@@ -351,10 +434,12 @@ final class BatchSession {
             if anchors.count == permutation.count { anchors = permutation.map { anchors[$0] } }
             persistAnchors(anchors)
             if raw.count == permutation.count { raw = permutation.map { raw[$0] } }
-            aligned = nil
+            geometry = nil
             alignedOptions = nil
             preview = []
+            ungradedPreview = []
             overlays = []
+            gradeGeneration += 1
             batch = Batch(url: batch.url, imageURLs: renamed)
             onReordered(batch)
             align(settings)
@@ -385,17 +470,65 @@ final class BatchSession {
         startAlign(settings)
     }
 
+    /// Open a batch that was already aligned. Reloads the scans, skips Vision.
+    func restore(_ settings: NapSettings) {
+        let options = settings.pipelineOptions(anchors: anchors)
+        if let geometry, alignedOptions == options {
+            if preview.isEmpty {
+                guard !isWorking else { return }
+                startMaterialize(geometry, grade: settings.gradeSettings)
+            } else {
+                regrade(settings.gradeSettings)
+            }
+            return
+        }
+        if !isWorking, status == .idle || alignedOptions != options {
+            align(settings)
+        }
+    }
+
+    private func startMaterialize(_ geometry: AlignmentGeometry, grade: GradeSettings) {
+        let flag = CancelFlag()
+        let generation = arm(flag)
+        let batch = batch
+        inflightOptions = alignedOptions
+        status = .working("loading")
+        job = Task {
+            defer { if generation == self.generation { self.inflightOptions = nil } }
+            do {
+                let rendered = try await Self.previews(batch: batch, geometry: geometry, grade: grade, flag: flag)
+                guard generation == self.generation, !flag.isCancelled else {
+                    self.settleCancel(generation)
+                    return
+                }
+                guard self.keepPixels else {
+                    self.status = .ready
+                    return
+                }
+                self.ungradedPreview = rendered.ungraded
+                self.preview = rendered.preview
+                self.status = .ready
+            } catch is CancellationError {
+                self.settleCancel(generation)
+            } catch {
+                guard generation == self.generation, !flag.isCancelled else { return }
+                self.status = .failed(error.localizedDescription)
+            }
+        }
+    }
+
     func startAlign(_ settings: NapSettings) {
         let flag = CancelFlag()
         let generation = arm(flag)
         let options = settings.pipelineOptions(anchors: anchors)
+        let grade = settings.gradeSettings
         let batch = batch
         inflightOptions = options
         status = .working("aligning")
         job = Task {
             defer { if generation == self.generation { self.inflightOptions = nil } }
             do {
-                let rendered = try await Self.render(batch: batch, options: options, flag: flag)
+                let rendered = try await Self.render(batch: batch, options: options, grade: grade, flag: flag)
                 guard generation == self.generation, !flag.isCancelled else {
                     self.settleCancel(generation)
                     return
@@ -418,22 +551,24 @@ final class BatchSession {
         let options = settings.pipelineOptions(anchors: anchors)
         let targets = settings.targets(for: batch, kinds: kinds)
         let exportSettings = settings.exportSettings
+        let grade = settings.gradeSettings
         let label = kinds.map(\.rawValue).sorted().joined(separator: " + ")
-        status = .working(alignedOptions == options && aligned != nil ? "exporting " + label : "aligning")
+        status = .working(alignedOptions == options && geometry != nil ? "exporting " + label : "aligning")
         job = Task {
             do {
-                let rendered: RenderedAlignment
-                if let aligned = self.aligned, self.alignedOptions == options {
-                    rendered = RenderedAlignment(aligned: aligned, preview: self.preview, overlays: self.overlays)
+                let aligned: AlignedBatch
+                if let geometry = self.geometry, self.alignedOptions == options {
+                    aligned = try await Self.reload(batch, geometry: geometry, flag: flag)
                 } else {
-                    rendered = try await Self.render(batch: batch, options: options, flag: flag)
+                    let rendered = try await Self.render(batch: batch, options: options, grade: grade, flag: flag)
                     guard generation == self.generation, !flag.isCancelled else { throw CancellationError() }
                     self.apply(rendered, options: options)
                     self.status = .working("exporting " + label)
+                    aligned = rendered.aligned
                 }
                 if flag.isCancelled || generation != self.generation { throw CancellationError() }
                 let urls = try await Exporter.export(
-                    rendered.aligned, to: targets, settings: exportSettings, isCancelled: { flag.isCancelled }
+                    aligned, to: targets, settings: exportSettings, isCancelled: { flag.isCancelled }
                 )
                 guard generation == self.generation, !flag.isCancelled else { return }
                 self.lastExport = urls
@@ -450,19 +585,21 @@ final class BatchSession {
 
     /// Sidebar export. `cached` means the on-screen alignment already matched, so Vision was skipped.
     func alignment(
-        matching options: PipelineOptions, flag: CancelFlag
+        matching options: PipelineOptions, grade: GradeSettings, flag: CancelFlag
     ) async throws -> (aligned: AlignedBatch, cached: Bool, generation: Int) {
         debounce?.cancel()
         debounce = nil
-        if let aligned, alignedOptions == options, !isWorking {
+        if let geometry, alignedOptions == options, !isWorking {
             cancelFlag = flag
+            let aligned = try await Self.reload(batch, geometry: geometry, flag: flag)
             return (aligned, true, generation)
         }
         if inflightOptions == options, let job {
             await job.value
             if flag.isCancelled { throw CancellationError() }
-            if let aligned, alignedOptions == options, !isWorking {
+            if let geometry, alignedOptions == options, !isWorking {
                 cancelFlag = flag
+                let aligned = try await Self.reload(batch, geometry: geometry, flag: flag)
                 return (aligned, true, generation)
             }
         }
@@ -472,7 +609,7 @@ final class BatchSession {
         inflightOptions = options
         status = .working("aligning")
         do {
-            let rendered = try await Self.render(batch: batch, options: options, flag: flag)
+            let rendered = try await Self.render(batch: batch, options: options, grade: grade, flag: flag)
             guard generation == self.generation, !flag.isCancelled else { throw CancellationError() }
             apply(rendered, options: options)
             inflightOptions = nil
@@ -498,13 +635,13 @@ final class BatchSession {
 
     func settleCancel(_ generation: Int) {
         guard generation == self.generation else { return }
-        status = aligned == nil ? .idle : .ready
+        status = geometry == nil ? .idle : .ready
     }
 
     /// Export was cancelled from outside. Leave a newer pin or quality change alone.
     func settleCancelIfCurrent(_ flag: CancelFlag) {
         guard cancelFlag === flag else { return }
-        status = aligned == nil ? .idle : .ready
+        status = geometry == nil ? .idle : .ready
     }
 
     func fail(_ generation: Int, _ message: String) {
@@ -532,20 +669,64 @@ final class BatchSession {
     }
 
     private func apply(_ rendered: RenderedAlignment, options: PipelineOptions) {
-        aligned = rendered.aligned
+        geometry = rendered.aligned.geometry
+        alignedOptions = options
+        gradeGeneration += 1
+        guard keepPixels else { return }
+        ungradedPreview = rendered.ungradedPreview
         preview = rendered.preview
         overlays = rendered.overlays
-        alignedOptions = options
     }
 
-    private static func render(batch: Batch, options: PipelineOptions, flag: CancelFlag) async throws -> RenderedAlignment {
+    /// Decode the scans and crop with stored geometry. The caller drops the result.
+    private static func reload(
+        _ batch: Batch, geometry: AlignmentGeometry, flag: CancelFlag
+    ) async throws -> AlignedBatch {
+        try await Task.detached(priority: .userInitiated) {
+            if flag.isCancelled { throw CancellationError() }
+            return try NapPipeline.reload(batch: batch, geometry: geometry)
+        }.value
+    }
+
+    private static func previews(
+        batch: Batch, geometry: AlignmentGeometry, grade: GradeSettings, flag: CancelFlag
+    ) async throws -> (ungraded: [CGImage], preview: [CGImage]) {
+        try await Task.detached(priority: .userInitiated) {
+            let aligned = try NapPipeline.reload(batch: batch, geometry: geometry)
+            if flag.isCancelled { throw CancellationError() }
+            let ungraded = Exporter.ungradedPreviewFrames(aligned, maxDimension: 1200)
+            if flag.isCancelled { throw CancellationError() }
+            return (ungraded, Exporter.gradeFrames(ungraded, grade: grade))
+        }.value
+    }
+
+    private static func render(
+        batch: Batch, options: PipelineOptions, grade: GradeSettings, flag: CancelFlag
+    ) async throws -> RenderedAlignment {
         try await Task.detached(priority: .userInitiated) {
             let aligned = try NapPipeline.align(batch: batch, options: options, isCancelled: { flag.isCancelled })
             if flag.isCancelled { throw CancellationError() }
-            let preview = Exporter.previewFrames(aligned, maxDimension: 1200)
+            let ungraded = Exporter.ungradedPreviewFrames(aligned, maxDimension: 1200)
+            if flag.isCancelled { throw CancellationError() }
+            let preview = Exporter.gradeFrames(ungraded, grade: grade)
             let overlays = aligned.subjects.compactMap { $0.mask.overlayImage(red: 224, green: 102, blue: 45, alpha: 110) }
-            return RenderedAlignment(aligned: aligned, preview: preview, overlays: overlays)
+            return RenderedAlignment(aligned: aligned, ungradedPreview: ungraded, preview: preview, overlays: overlays)
         }.value
+    }
+
+    /// Slider drags. The ungraded frames are already cached, so this skips alignment.
+    func regrade(_ grade: GradeSettings) {
+        let base = ungradedPreview
+        guard !base.isEmpty else { return }
+        gradeGeneration += 1
+        let token = gradeGeneration
+        Task {
+            let graded = await Task.detached(priority: .userInitiated) {
+                Exporter.gradeFrames(base, grade: grade)
+            }.value
+            guard token == self.gradeGeneration else { return }
+            self.preview = graded
+        }
     }
 
     func revealExports() {

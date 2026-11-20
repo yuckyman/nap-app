@@ -8,6 +8,7 @@ struct BatchDetailView: View {
 
     @State private var showRaw = false
     @State private var showMasks = true
+    @State private var showingGrade = false
     @State private var playing = true
     @State private var fps = 10.0
 
@@ -17,8 +18,19 @@ struct BatchDetailView: View {
         @Bindable var model = model
         VStack(spacing: 0) {
             ZStack {
-                WiggleView(frames: showRaw ? session.raw : session.preview, order: order, fps: fps, playing: playing)
-                    .padding(20)
+                WiggleView(
+                    frames: showRaw ? session.raw : session.preview,
+                    order: order,
+                    fps: fps,
+                    playing: playing,
+                    anchor: session.wiggleAnchorPoint(rawMode: showRaw),
+                    center: session.wiggleCenterPoint(rawMode: showRaw),
+                    showIndicators: showMasks || session.isWorking
+                ) { point in
+                    session.setWiggleAnchor(point, rawMode: showRaw)
+                    session.align(model.settings, debounced: point != nil)
+                }
+                .padding(20)
                 statusOverlay
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -59,6 +71,15 @@ struct BatchDetailView: View {
                 Toggle(isOn: $showMasks) { Label("masks", systemImage: "person.crop.rectangle") }
                     .help("show the subject mask on each frame")
 
+                Button { showingGrade.toggle() } label: {
+                    Label("grade", systemImage: "slider.horizontal.3")
+                }
+                .help("adjust exposure/color matching and black point")
+                .popover(isPresented: $showingGrade, arrowEdge: .bottom) {
+                    GradePopoverView()
+                        .environment(model)
+                }
+
                 Picker("quality", selection: $model.settings.quality) {
                     ForEach(QualityPreset.allCases) { Text($0.rawValue).tag($0) }
                 }
@@ -73,6 +94,7 @@ struct BatchDetailView: View {
                     Button("gif") { session.export([.gif], settings: model.settings) }
                     Button("mp4") { session.export([.mp4], settings: model.settings) }
                     Button("print stills") { session.export([.stills], settings: model.settings) }
+                        .help("full-res frames in the batch folder, exposure-matched like the wiggle")
                     Divider()
                     Button("gif + mp4") { session.export([.gif, .mp4], settings: model.settings) }
                         .keyboardShortcut("e")
@@ -80,22 +102,23 @@ struct BatchDetailView: View {
                 } label: {
                     Label("export", systemImage: "square.and.arrow.up")
                 }
-                .disabled(session.aligned == nil || session.isWorking)
+                .disabled(session.geometry == nil || session.isWorking)
 
                 Button { session.revealExports() } label: { Label("reveal", systemImage: "folder") }
                     .disabled(session.lastExport.isEmpty)
                     .help("show the last export in finder")
             }
         }
+        .onChange(of: model.settings.gradeSettings) { session.regrade(model.settings.gradeSettings) }
         .task {
             session.loadRaw()
-            if session.aligned == nil, session.status == .idle { session.align(model.settings) }
+            session.restore(model.settings)
         }
     }
 
     private var subtitle: String {
-        guard let aligned = session.aligned else { return "\(session.batch.imageURLs.count) scans" }
-        return "\(Int(aligned.crop.width))×\(Int(aligned.crop.height)) · avg iou \(String(format: "%.2f", aligned.averageIoU))"
+        guard let geometry = session.geometry else { return "\(session.batch.imageURLs.count) scans" }
+        return "\(Int(geometry.crop.width))×\(Int(geometry.crop.height)) · avg iou \(String(format: "%.2f", geometry.averageIoU))"
     }
 
     @ViewBuilder private var statusOverlay: some View {
@@ -127,21 +150,199 @@ struct WiggleView: View {
     let order: [Int]
     let fps: Double
     let playing: Bool
+    var anchor: CGPoint? = nil
+    var center: CGPoint? = nil
+    var showIndicators: Bool = false
+    var onPick: ((CGPoint?) -> Void)? = nil
+
+    @State private var hoveringImage = false
+    @State private var recentlyPinned = false
+    @State private var pinFade: Task<Void, Never>?
+
+    init(
+        frames: [CGImage],
+        order: [Int],
+        fps: Double,
+        playing: Bool,
+        anchor: CGPoint? = nil,
+        center: CGPoint? = nil,
+        showIndicators: Bool = false,
+        onPick: ((CGPoint?) -> Void)? = nil
+    ) {
+        self.frames = frames
+        self.order = order
+        self.fps = fps
+        self.playing = playing
+        self.anchor = anchor
+        self.center = center
+        self.showIndicators = showIndicators
+        self.onPick = onPick
+    }
 
     var body: some View {
         if frames.isEmpty {
             ProgressView()
+        } else if onPick != nil {
+            playback
+                .overlay { pickLayer }
+                .help("click to pin the focal subject · ⌥-click clears")
+                .onDisappear {
+                    pinFade?.cancel()
+                    hoveringImage = false
+                    NSCursor.arrow.set()
+                }
         } else {
-            TimelineView(.animation(minimumInterval: 1 / fps, paused: !playing)) { context in
-                let step = Int(context.date.timeIntervalSinceReferenceDate * fps)
-                let index = min(frames.count - 1, order[step % order.count])
-                Image(decorative: frames[index], scale: 1)
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fit)
-                    .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
+            playback
+        }
+    }
+
+    /// The playing frames. The click layer sits outside this, so a 10fps tick doesn't reset the hover.
+    private var playback: some View {
+        TimelineView(.animation(minimumInterval: 1 / fps, paused: !playing)) { context in
+            let step = Int(context.date.timeIntervalSinceReferenceDate * fps)
+            let index = min(frames.count - 1, order[step % order.count])
+            Image(decorative: frames[index], scale: 1)
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
+        }
+    }
+
+    /// Hit testing lives here, not inside `playback`, so the gesture survives every animation frame.
+    private var pickLayer: some View {
+        GeometryReader { geo in
+            let rect = aspectFitRect(
+                image: CGSize(width: CGFloat(frames[0].width), height: CGFloat(frames[0].height)),
+                in: geo.size
+            )
+            let showMarks = (hoveringImage && showIndicators) || recentlyPinned
+            ZStack {
+                Color.clear
+                    .contentShape(Rectangle())
+                if showMarks {
+                    if let center {
+                        Image(systemName: "plus")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .shadow(radius: 2)
+                            .position(x: rect.minX + center.x * rect.width, y: rect.minY + center.y * rect.height)
+                            .allowsHitTesting(false)
+                    }
+                    if let anchor {
+                        Circle()
+                            .strokeBorder(.white, lineWidth: 2)
+                            .background(Circle().fill(Color.ember.opacity(0.6)))
+                            .frame(width: 18, height: 18)
+                            .shadow(radius: 2)
+                            .position(x: rect.minX + anchor.x * rect.width, y: rect.minY + anchor.y * rect.height)
+                            .allowsHitTesting(false)
+                    }
+                }
+            }
+            .animation(.easeOut(duration: 0.15), value: showMarks)
+            .animation(.easeOut(duration: 0.15), value: center)
+            .animation(.easeOut(duration: 0.15), value: anchor)
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let point):
+                    let inside = rect.contains(point)
+                    if hoveringImage != inside { hoveringImage = inside }
+                    if inside {
+                        NSCursor.crosshair.set()
+                    } else {
+                        NSCursor.arrow.set()
+                    }
+                case .ended:
+                    hoveringImage = false
+                    NSCursor.arrow.set()
+                @unknown default:
+                    break
+                }
+            }
+            .onTapGesture(coordinateSpace: .local) { location in
+                guard rect.contains(location), rect.width > 1, rect.height > 1 else { return }
+                if NSEvent.modifierFlags.contains(.option) {
+                    onPick?(nil)
+                } else {
+                    onPick?(CGPoint(
+                        x: min(1, max(0, (location.x - rect.minX) / rect.width)),
+                        y: min(1, max(0, (location.y - rect.minY) / rect.height))
+                    ))
+                    pinFade?.cancel()
+                    recentlyPinned = true
+                    pinFade = Task {
+                        try? await Task.sleep(nanoseconds: 1_200_000_000)
+                        guard !Task.isCancelled else { return }
+                        recentlyPinned = false
+                    }
+                }
             }
         }
+    }
+}
+
+/// One grading slider: a name, a live percent, and an optional caption.
+struct GradeSliderRow: View {
+    let title: String
+    var caption: String = ""
+    @Binding var value: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                Spacer(minLength: 8)
+                Text("\(Int((value * 100).rounded()))%")
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 52, alignment: .trailing)
+            }
+            Slider(value: $value, in: 0...1)
+            if !caption.isEmpty {
+                Text(caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// The toolbar popover. Dragging either slider regrades the playing wiggle immediately.
+struct GradePopoverView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        @Bindable var model = model
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("grade").font(.headline)
+                Spacer()
+                Button("reset") {
+                    model.settings.gradeStrength = GradeSettings.defaultMatchStrength
+                    model.settings.blackPoint = GradeSettings.defaultBlackPoint
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .disabled(model.settings.gradeStrength == GradeSettings.defaultMatchStrength
+                          && model.settings.blackPoint == GradeSettings.defaultBlackPoint)
+            }
+            GradeSliderRow(
+                title: "exposure & color match",
+                caption: "evens out lens exposure and color shifts to stop flicker.",
+                value: $model.settings.gradeStrength
+            )
+            GradeSliderRow(
+                title: "black point",
+                caption: "pulls lifted scanner shadows down so blacks stay sharp and even.",
+                value: $model.settings.blackPoint
+            )
+        }
+        .padding(14)
+        .frame(width: 280)
     }
 }
 
@@ -165,7 +366,7 @@ struct FrameStrip: View {
                         overlay: showMasks && index < session.overlays.count ? session.overlays[index] : nil,
                         anchor: index < session.anchors.count ? session.anchors[index] : nil,
                         center: index < session.centers.count ? session.centers[index] : nil,
-                        report: session.aligned.flatMap { index < $0.reports.count ? $0.reports[index] : nil },
+                        report: session.geometry.flatMap { index < $0.reports.count ? $0.reports[index] : nil },
                         targeted: targeted == index,
                         onTap: { point in onAnchor(index, point) },
                         onDrop: { dropped, after in
@@ -184,7 +385,7 @@ struct FrameStrip: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 Text("subject").font(.headline)
-                Text("click a frame to pin the subject. pin frame 1 and the rest follow. ⌥-click unpins.")
+                Text("click the wiggle above or a frame below to pin the subject. pin frame 1 and the rest follow. ⌥-click unpins.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -307,7 +508,7 @@ struct ReportBar: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 18) {
-            if let aligned = session.aligned {
+            if let aligned = session.geometry {
                 ForEach(Array(aligned.reports.enumerated()).dropFirst(), id: \.offset) { index, report in
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 6) {

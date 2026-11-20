@@ -41,6 +41,57 @@ public struct IntPoint: Hashable, Sendable {
     public var y: Int
 }
 
+/// The alignment decision without the scans. Offsets, crop, and subject centers
+/// are enough to put the wiggle back together, so a session can drop the bitmaps.
+public struct AlignmentGeometry: Sendable {
+    public var sourceSizes: [CGSize]
+    public var offsets: [IntPoint]
+    /// Shared crop in canvas pixels; every frame is exactly this size.
+    public var crop: CGRect
+    public var reports: [FrameReport]
+    public var analysisSize: CGSize
+    /// Subject centers in analysis pixels, top-left origin.
+    public var subjectCenters: [CGPoint]
+    public var warnings: [String]
+
+    public var averageIoU: Double {
+        let rest = reports.dropFirst()
+        return rest.isEmpty ? 1 : rest.map(\.iou).reduce(0, +) / Double(rest.count)
+    }
+
+    /// Normalized `0...1` point on frame 1 for a point on the aligned wiggle.
+    public func sourceAnchor(fromAlignedPoint point: CGPoint) -> CGPoint {
+        guard let size = sourceSizes.first, size.width > 0, size.height > 0,
+              crop.width > 0, crop.height > 0, let o0 = offsets.first else { return point }
+        let x0 = (Double(crop.minX) - Double(o0.x)) + Double(point.x) * Double(crop.width)
+        let y0 = (Double(crop.minY) - Double(o0.y)) + Double(point.y) * Double(crop.height)
+        return CGPoint(
+            x: min(1, max(0, x0 / Double(size.width))),
+            y: min(1, max(0, y0 / Double(size.height)))
+        )
+    }
+
+    /// Inverse of `sourceAnchor(fromAlignedPoint:)`. Nil when the frame 1 anchor
+    /// falls outside the aligned crop.
+    public func alignedPoint(fromSourceAnchor anchor: CGPoint) -> CGPoint? {
+        guard let size = sourceSizes.first, size.width > 0, size.height > 0,
+              crop.width > 0, crop.height > 0, let o0 = offsets.first else { return nil }
+        let u = (Double(anchor.x) * Double(size.width) - (Double(crop.minX) - Double(o0.x))) / Double(crop.width)
+        let v = (Double(anchor.y) * Double(size.height) - (Double(crop.minY) - Double(o0.y))) / Double(crop.height)
+        guard u >= 0, u <= 1, v >= 0, v <= 1 else { return nil }
+        return CGPoint(x: u, y: v)
+    }
+
+    /// Pair stored geometry with freshly decoded scans. Subjects are not restored;
+    /// the centers live on this value, and a full align rebuilds the masks.
+    public func alignedBatch(batch: Batch, sources: [SourceFrame]) -> AlignedBatch {
+        AlignedBatch(
+            batch: batch, sources: sources, offsets: offsets, crop: crop, reports: reports,
+            analysisSize: analysisSize, subjects: [], warnings: warnings
+        )
+    }
+}
+
 public struct AlignedBatch: @unchecked Sendable {
     public let batch: Batch
     public let sources: [SourceFrame]
@@ -51,6 +102,26 @@ public struct AlignedBatch: @unchecked Sendable {
     public let analysisSize: CGSize
     public let subjects: [SubjectChoice]
     public let warnings: [String]
+
+    public var geometry: AlignmentGeometry {
+        AlignmentGeometry(
+            sourceSizes: sources.map { CGSize(width: $0.width, height: $0.height) },
+            offsets: offsets,
+            crop: crop,
+            reports: reports,
+            analysisSize: analysisSize,
+            subjectCenters: subjects.map(\.center),
+            warnings: warnings
+        )
+    }
+
+    public func sourceAnchor(fromAlignedPoint point: CGPoint) -> CGPoint {
+        geometry.sourceAnchor(fromAlignedPoint: point)
+    }
+
+    public func alignedPoint(fromSourceAnchor anchor: CGPoint) -> CGPoint? {
+        geometry.alignedPoint(fromSourceAnchor: anchor)
+    }
 
     /// Full-resolution aligned frame. A crop of the original scan, never resampled.
     public func alignedFrame(_ index: Int) -> CGImage {
@@ -80,6 +151,13 @@ public enum PipelineError: LocalizedError {
 }
 
 public enum NapPipeline {
+    /// Decode the scans and crop them with a stored alignment. Skips Vision.
+    public static func reload(batch: Batch, geometry: AlignmentGeometry) throws -> AlignedBatch {
+        let sources = ImageLoader.normalizeSizes(try batch.imageURLs.map(ImageLoader.load))
+        guard sources.count == geometry.offsets.count else { throw PipelineError.notEnoughScans(sources.count) }
+        return geometry.alignedBatch(batch: batch, sources: sources)
+    }
+
     /// `isCancelled` is checked between stages. A Vision request already inside
     /// `perform` runs to the end; the next frame's flow does not start.
     public static func align(

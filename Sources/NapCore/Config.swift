@@ -103,6 +103,8 @@ public enum NapEnvironment {
         "NAP_QUALITY",
         "NAP_MP4_LOOPS",
         "NAP_CENTER_SUBJECT",
+        "NAP_GRADE_STRENGTH",
+        "NAP_BLACK_POINT",
     ]
 
     /// Rewrite `KEY=VALUE` lines for `values`. Empty string clears a key by commenting
@@ -143,7 +145,10 @@ public enum NapEnvironment {
         let ordered = managedKeys.filter { missing.contains($0) } + extras
         if !ordered.isEmpty {
             if let last = lines.last, !last.isEmpty { lines.append("") }
-            let appOnly: Set<String> = ["NAP_QUALITY", "NAP_MP4_LOOPS", "NAP_CENTER_SUBJECT"]
+            let appOnly: Set<String> = [
+                "NAP_QUALITY", "NAP_MP4_LOOPS", "NAP_CENTER_SUBJECT",
+                "NAP_GRADE_STRENGTH", "NAP_BLACK_POINT",
+            ]
             let needsAppComment = ordered.contains { appOnly.contains($0) }
                 && !lines.contains { $0.contains("app settings") }
             var wroteAppComment = false

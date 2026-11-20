@@ -115,9 +115,7 @@ struct SettingsView: View {
             Section("folders") {
                 FolderRow(title: "scans", path: $model.settings.inputDir, placeholder: "parent of the numbered batch folders")
                     .onChange(of: model.settings.inputDir) { model.reloadBatches() }
-                FolderRow(title: "gif output", path: $model.settings.gifDir, placeholder: "next to each batch")
-                FolderRow(title: "mp4 output", path: $model.settings.mp4Dir, placeholder: "same as gif")
-                FolderRow(title: "print stills", path: $model.settings.stillsDir, placeholder: "<gif output>/stills")
+                FolderRow(title: "library", path: $model.settings.gifDir, placeholder: "one folder per batch: gif, mp4, stills")
                 ConfigFileRow()
             }
             Section("alignment") {
@@ -131,15 +129,28 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("grading") {
+                GradeSliderRow(title: "exposure & color match", value: $model.settings.gradeStrength)
+                GradeSliderRow(title: "black point", value: $model.settings.blackPoint)
+                Button("reset") {
+                    model.settings.gradeStrength = GradeSettings.defaultMatchStrength
+                    model.settings.blackPoint = GradeSettings.defaultBlackPoint
+                }
+                .disabled(model.settings.gradeStrength == GradeSettings.defaultMatchStrength
+                          && model.settings.blackPoint == GradeSettings.defaultBlackPoint)
+                Text("evens out lens exposure and color shifts to stop flicker, and pulls lifted scanner shadows down so blacks stay sharp.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("mp4") {
                 Stepper("loops: \(model.settings.mp4Loops)", value: $model.settings.mp4Loops, in: 1...20)
-                Text("quality, loops, and centering save into that same file.")
+                Text("quality, grading, loops, and centering save into that same file.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
-        .frame(width: 640, height: 700)
+        .frame(width: 640, height: 860)
     }
 }
 

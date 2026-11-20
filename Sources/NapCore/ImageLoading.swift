@@ -30,18 +30,16 @@ public enum ImageLoader {
         let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
         let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
 
+        // Thumbnails resample and can drop a 16-bit TIFF/PNG to 8-bit. Decode the
+        // full image, then bake EXIF orientation in a context that keeps the depth.
+        let decoded = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
         let image: CGImage?
         if orientation == 1 {
-            image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCacheImmediately: true] as CFDictionary)
+            image = decoded
+        } else if let decoded {
+            image = Self.oriented(decoded, exif: orientation)
         } else {
-            let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
-            let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
-            image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: max(w, h),
-                kCGImageSourceShouldCacheImmediately: true,
-            ] as CFDictionary)
+            image = nil
         }
         guard let image else { throw ImageLoadError.unreadable(url) }
 
@@ -53,6 +51,85 @@ public enum ImageLoader {
         }
         let type = (CGImageSourceGetType(source) as String?) ?? UTType.jpeg.identifier
         return SourceFrame(url: url, image: image, dpi: dpi, typeIdentifier: type)
+    }
+
+    /// Bake EXIF orientations 1...8 into pixels. 90° turns swap the stored size.
+    /// Nearest-neighbor and the source bit depth, so a 16-bit scan stays 16-bit.
+    private static func oriented(_ image: CGImage, exif: Int) -> CGImage? {
+        guard let orientation = CGImagePropertyOrientation(rawValue: UInt32(exif)), orientation != .up else {
+            return image
+        }
+        let srcW = image.width, srcH = image.height
+        guard srcW > 0, srcH > 0 else { return image }
+        let swapped: Bool
+        switch orientation {
+        case .left, .leftMirrored, .right, .rightMirrored: swapped = true
+        default: swapped = false
+        }
+        let dstW = swapped ? srcH : srcW
+        let dstH = swapped ? srcW : srcH
+        let bpc = image.bitsPerComponent > 8 ? 16 : 8
+        guard let context = bitmapContext(width: dstW, height: dstH, bitsPerComponent: bpc, colorSpace: image.colorSpace) else {
+            return nil
+        }
+        context.interpolationQuality = .none
+
+        // Same bake-in as UIImage's orientation transform: destination size, then
+        // draw the raw pixels through a CTM. Default context origin is bottom-left.
+        var transform = CGAffineTransform.identity
+        let w = CGFloat(dstW), h = CGFloat(dstH)
+        switch orientation {
+        case .down, .downMirrored:
+            transform = transform.translatedBy(x: w, y: h).rotated(by: .pi)
+        case .left, .leftMirrored:
+            transform = transform.translatedBy(x: w, y: 0).rotated(by: .pi / 2)
+        case .right, .rightMirrored:
+            transform = transform.translatedBy(x: 0, y: h).rotated(by: -.pi / 2)
+        default:
+            break
+        }
+        switch orientation {
+        case .upMirrored, .downMirrored:
+            transform = transform.translatedBy(x: w, y: 0).scaledBy(x: -1, y: 1)
+        case .leftMirrored, .rightMirrored:
+            transform = transform.translatedBy(x: h, y: 0).scaledBy(x: -1, y: 1)
+        default:
+            break
+        }
+        context.concatenate(transform)
+        context.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(srcW), height: CGFloat(srcH)))
+        return context.makeImage()
+    }
+
+    private static func bitmapContext(width: Int, height: Int, bitsPerComponent: Int, colorSpace: CGColorSpace?) -> CGContext? {
+        let alpha = CGImageAlphaInfo.premultipliedLast.rawValue
+        let bitmapInfo = bitsPerComponent == 16
+            ? (CGImageByteOrderInfo.order16Host.rawValue | alpha)
+            : alpha
+        let spaces = [colorSpace, CGColorSpace(name: CGColorSpace.sRGB)].compactMap { $0 }
+        for space in spaces {
+            if let context = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: bitsPerComponent, bytesPerRow: 0,
+                space: space, bitmapInfo: bitmapInfo
+            ) {
+                return context
+            }
+        }
+        let opaque = CGImageAlphaInfo.noneSkipLast.rawValue
+        let opaqueInfo = bitsPerComponent == 16
+            ? (CGImageByteOrderInfo.order16Host.rawValue | opaque)
+            : opaque
+        for space in spaces {
+            if let context = CGContext(
+                data: nil, width: width, height: height,
+                bitsPerComponent: bitsPerComponent, bytesPerRow: 0,
+                space: space, bitmapInfo: opaqueInfo
+            ) {
+                return context
+            }
+        }
+        return nil
     }
 
     public static func thumbnail(_ url: URL, maxPixel: Int) -> CGImage? {

@@ -14,6 +14,10 @@ struct NapSettings: Equatable {
     var quality: QualityPreset = .best
     var mp4Loops = 1
     var centerSubject = true
+    /// 0...1. How hard to even out exposure and color across the four lenses.
+    var gradeStrength: Double = GradeSettings.defaultMatchStrength
+    /// 0...1. Pulls lifted scanner shadows back toward black.
+    var blackPoint: Double = GradeSettings.defaultBlackPoint
     /// Empty means "the default file" (baked path, else the repo `.env`).
     var dotenvPath = ""
 
@@ -30,6 +34,8 @@ struct NapSettings: Equatable {
         var quality: QualityPreset?
         var mp4Loops: Int?
         var centerSubject: Bool?
+        var gradeStrength: Double?
+        var blackPoint: Double?
         var dotenvPath: String?
         var dotenvBacked: Bool?
     }
@@ -41,6 +47,8 @@ struct NapSettings: Equatable {
             if let quality = blob.quality { settings.quality = quality }
             if let loops = blob.mp4Loops { settings.mp4Loops = min(20, max(1, loops)) }
             if let center = blob.centerSubject { settings.centerSubject = center }
+            if let strength = blob.gradeStrength { settings.gradeStrength = min(1, max(0, strength)) }
+            if let black = blob.blackPoint { settings.blackPoint = min(1, max(0, black)) }
             if let path = blob.dotenvPath { settings.dotenvPath = path }
             settings.inputDir = blob.inputDir ?? ""
             settings.gifDir = blob.gifDir ?? ""
@@ -109,17 +117,22 @@ struct NapSettings: Equatable {
         if let raw = env["NAP_QUALITY"], let preset = QualityPreset(rawValue: raw) { quality = preset }
         if let raw = env["NAP_MP4_LOOPS"], let loops = Int(raw) { mp4Loops = min(20, max(1, loops)) }
         if let raw = env["NAP_CENTER_SUBJECT"], let flag = NapEnvironment.parseBool(raw) { centerSubject = flag }
+        if let raw = env["NAP_GRADE_STRENGTH"], let value = Double(raw).map({ min(1, max(0, $0)) }) { gradeStrength = value }
+        if let raw = env["NAP_BLACK_POINT"], let value = Double(raw).map({ min(1, max(0, $0)) }) { blackPoint = value }
     }
 
     private func dotenvValues() -> [String: String] {
         [
             "NAP_INPUT_DIR": inputDir,
             "NAP_GIF_OUTPUT_DIR": gifDir,
-            "NAP_MP4_OUTPUT_DIR": mp4Dir,
-            "NAP_STILLS_OUTPUT_DIR": stillsDir,
+            // Retired. The library is one folder per batch, so these stay commented out.
+            "NAP_MP4_OUTPUT_DIR": "",
+            "NAP_STILLS_OUTPUT_DIR": "",
             "NAP_QUALITY": quality.rawValue,
             "NAP_MP4_LOOPS": String(mp4Loops),
             "NAP_CENTER_SUBJECT": centerSubject ? "true" : "false",
+            "NAP_GRADE_STRENGTH": String(format: "%.2f", min(1, max(0, gradeStrength))),
+            "NAP_BLACK_POINT": String(format: "%.2f", min(1, max(0, blackPoint))),
         ]
     }
 
@@ -127,6 +140,7 @@ struct NapSettings: Equatable {
         let blob = Blob(
             inputDir: inputDir, gifDir: gifDir, mp4Dir: mp4Dir, stillsDir: stillsDir,
             quality: quality, mp4Loops: mp4Loops, centerSubject: centerSubject,
+            gradeStrength: gradeStrength, blackPoint: blackPoint,
             dotenvPath: dotenvPath, dotenvBacked: dotenvBacked
         )
         if let data = try? JSONEncoder().encode(blob) { UserDefaults.standard.set(data, forKey: Self.key) }
@@ -135,18 +149,19 @@ struct NapSettings: Equatable {
     var inputURL: URL? { inputDir.isEmpty ? nil : NapEnvironment.expandPath(inputDir) }
 
     func targets(for batch: Batch, kinds: Set<ExportKind>) -> ExportTargets {
-        let gifRoot = gifDir.isEmpty ? batch.url.deletingLastPathComponent() : NapEnvironment.expandPath(gifDir)
-        let mp4Root = mp4Dir.isEmpty ? gifRoot : NapEnvironment.expandPath(mp4Dir)
-        let stillsRoot = stillsDir.isEmpty ? gifRoot.appendingPathComponent("stills") : NapEnvironment.expandPath(stillsDir)
-        return ExportTargets(
-            gif: kinds.contains(.gif) ? gifRoot.appendingPathComponent(batch.name + ".gif") : nil,
-            mp4: kinds.contains(.mp4) ? mp4Root.appendingPathComponent(batch.name + ".mp4") : nil,
-            stillsDirectory: kinds.contains(.stills) ? stillsRoot.appendingPathComponent(batch.name) : nil
+        let library = gifDir.isEmpty ? batch.url.deletingLastPathComponent() : NapEnvironment.expandPath(gifDir)
+        return .bundle(
+            in: library, name: batch.name,
+            gif: kinds.contains(.gif), mp4: kinds.contains(.mp4), stills: kinds.contains(.stills)
         )
     }
 
+    var gradeSettings: GradeSettings {
+        GradeSettings(matchStrength: gradeStrength, blackPoint: blackPoint)
+    }
+
     var exportSettings: ExportSettings {
-        ExportSettings(gifMaxDimension: quality.gifMaxDimension, mp4Loops: mp4Loops)
+        ExportSettings(gifMaxDimension: quality.gifMaxDimension, mp4Loops: mp4Loops, grade: gradeSettings)
     }
 
     func pipelineOptions(anchors: [CGPoint?]) -> PipelineOptions {
